@@ -163,7 +163,8 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	bool additive_mode)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -309,10 +310,60 @@ renderCUDA(
 			if (power > 0.0f)
 				continue;
 
-            const float G = exp(power);
+			const float G = exp(power);
 			const float alpha = min(0.99f, opa * G);
 			if (alpha < 1.0f / 255.0f)
 				continue;
+
+			if (additive_mode)
+			{
+				const int global_id = collected_id[j];
+				float dL_dalpha = 0.0f;
+				for (int ch = 0; ch < C; ch++)
+				{
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
+					const float dL_dchannel = dL_dpixel[ch];
+					dL_dalpha += c * dL_dchannel;
+					atomicAdd(&(dL_dcolors[global_id * C + ch]), alpha * dL_dchannel);
+				}
+
+				const float dL_dG = opa * dL_dalpha;
+				const float dL_dz = 0.0f;
+				if (rho3d <= rho2d) {
+					const float2 dL_ds = {
+						dL_dG * -G * s.x + dL_dz * Tw.x,
+						dL_dG * -G * s.y + dL_dz * Tw.y
+					};
+					const float3 dz_dTw = {s.x, s.y, 1.0};
+					const float dsx_pz = dL_ds.x / p.z;
+					const float dsy_pz = dL_ds.y / p.z;
+					const float3 dL_dp = {dsx_pz, dsy_pz, -(dsx_pz * s.x + dsy_pz * s.y)};
+					const float3 dL_dk = cross(l, dL_dp);
+					const float3 dL_dl = cross(dL_dp, k);
+					const float3 dL_dTu = {-dL_dk.x, -dL_dk.y, -dL_dk.z};
+					const float3 dL_dTv = {-dL_dl.x, -dL_dl.y, -dL_dl.z};
+					const float3 dL_dTw = {
+						pixf.x * dL_dk.x + pixf.y * dL_dl.x + dL_dz * dz_dTw.x,
+						pixf.x * dL_dk.y + pixf.y * dL_dl.y + dL_dz * dz_dTw.y,
+						pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz * dz_dTw.z};
+					atomicAdd(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
+					atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
+				} else {
+					const float dG_ddelx = -G * FilterInvSquare * d.x;
+					const float dG_ddely = -G * FilterInvSquare * d.y;
+					atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx);
+					atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely);
+				}
+				atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+				continue;
+			}
 
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;  
@@ -774,7 +825,8 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	bool additive_mode)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -797,5 +849,6 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
-		dL_dcolors);
+		dL_dcolors,
+		additive_mode);
 }

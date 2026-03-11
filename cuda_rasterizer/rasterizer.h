@@ -48,6 +48,7 @@ namespace CudaRasterizer
 			const float* cam_pos,
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
+			const bool additive_mode,
 			float* out_color,
 			float* out_others,
 			float* out_converge,
@@ -85,6 +86,7 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
+			bool additive_mode,
 			bool debug);
 	};
 };

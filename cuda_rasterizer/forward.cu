@@ -274,7 +274,8 @@ renderCUDA(
 	uint32_t* __restrict__ n_converge,
 	float* __restrict__ out_color,
 	float* __restrict__ out_others,
-	float* __restrict__ out_converge)
+	float* __restrict__ out_converge,
+	bool additive_mode)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -394,7 +395,7 @@ renderCUDA(
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
-			if (test_T < 0.0001f)
+			if (!additive_mode && test_T < 0.0001f)
 			{
 				done = true;
 				continue;
@@ -404,7 +405,7 @@ renderCUDA(
                 first_depth = depth;
             }
 
-			float w = alpha * T;
+			float w = additive_mode ? alpha : alpha * T;
 #if RENDER_AXUTILITY
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
@@ -447,7 +448,8 @@ renderCUDA(
 				last_converge = contributor;
 			}
 
- 			T = test_T;
+	 		if (!additive_mode)
+	 			T = test_T;
             last_depth = depth;
 
 			// Keep track of last range entry to update this pixel.
@@ -459,12 +461,12 @@ renderCUDA(
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
 	{
-		final_T[pix_id] = T;
+		final_T[pix_id] = additive_mode ? 1.0f : T;
 		n_contrib[pix_id] = last_contributor;  // index of the last effective gaussian
 		n_converge[pix_id] = last_converge;
 
 		for (int ch = 0; ch < CHANNELS; ch++)
-			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+			out_color[ch * H * W + pix_id] = C[ch] + (additive_mode ? 0.0f : T * bg_color[ch]);
 
 #if RENDER_AXUTILITY
 		n_contrib[pix_id + H * W] = median_contributor;
@@ -499,7 +501,8 @@ void FORWARD::render(
     uint32_t *n_converge,
     float *out_color,
     float *out_others,
-    float *out_converge)
+	float *out_converge,
+	bool additive_mode)
 {
     renderCUDA<NUM_CHANNELS><<<grid, block>>>(
         ranges,
@@ -514,10 +517,11 @@ void FORWARD::render(
         final_T,
         n_contrib,
         bg_color,
-        n_converge,
-        out_color,
-        out_others,
-        out_converge);
+		n_converge,
+		out_color,
+		out_others,
+		out_converge,
+		additive_mode);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

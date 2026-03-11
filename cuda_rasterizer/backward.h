@@ -43,7 +43,8 @@ namespace BACKWARD
 		float3* dL_dmean2D,
 		float* dL_dnormal3D,
 		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dcolors,
+		bool additive_mode);
 
 	void preprocess(
         int P, int D, int M,

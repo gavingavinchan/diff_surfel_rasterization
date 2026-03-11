@@ -65,7 +65,8 @@ namespace FORWARD
         uint32_t *n_converge,
         float *out_color,
         float *out_others,
-        float *out_converge);
+        float *out_converge,
+        bool additive_mode);
 }
 
 
