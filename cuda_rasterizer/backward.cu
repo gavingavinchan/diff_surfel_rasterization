@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <stdexcept>
 namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
@@ -139,8 +140,18 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 }
 
 
+// Each contribution retains the existing float arithmetic. Additive sonar
+// rendering sums those contributions in double before a single float cast,
+// avoiding order-sensitive float atomic accumulation across pixels/tiles.
+// This improves reproducibility; it is not a general deterministic CUDA claim.
+template <typename T>
+__device__ inline void accumulateGradient(T* target, float value)
+{
+    atomicAdd(target, static_cast<T>(value));
+}
+
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C, typename AccumT>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -159,11 +170,11 @@ renderCUDA(
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_depths,
 	const float* __restrict__ dL_dpixconverge,
-	float * __restrict__ dL_dtransMat,
-	float3* __restrict__ dL_dmean2D,
-	float* __restrict__ dL_dnormal3D,
-	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors,
+	AccumT* __restrict__ dL_dtransMat,
+	AccumT* __restrict__ dL_dmean2D,
+	AccumT* __restrict__ dL_dnormal3D,
+	AccumT* __restrict__ dL_dopacity,
+	AccumT* __restrict__ dL_dcolors,
 	bool additive_mode)
 {
 	// We rasterize again. Compute necessary block info.
@@ -324,7 +335,7 @@ renderCUDA(
 					const float c = collected_colors[ch * BLOCK_SIZE + j];
 					const float dL_dchannel = dL_dpixel[ch];
 					dL_dalpha += c * dL_dchannel;
-					atomicAdd(&(dL_dcolors[global_id * C + ch]), alpha * dL_dchannel);
+					accumulateGradient(&(dL_dcolors[global_id * C + ch]), alpha * dL_dchannel);
 				}
 
 				const float dL_dG = opa * dL_dalpha;
@@ -346,22 +357,22 @@ renderCUDA(
 						pixf.x * dL_dk.x + pixf.y * dL_dl.x + dL_dz * dz_dTw.x,
 						pixf.x * dL_dk.y + pixf.y * dL_dl.y + dL_dz * dz_dTw.y,
 						pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz * dz_dTw.z};
-					atomicAdd(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
-					atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
+					accumulateGradient(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
 				} else {
 					const float dG_ddelx = -G * FilterInvSquare * d.x;
 					const float dG_ddely = -G * FilterInvSquare * d.y;
-					atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx);
-					atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely);
+					accumulateGradient(&dL_dmean2D[global_id * 3], dL_dG * dG_ddelx);
+					accumulateGradient(&dL_dmean2D[global_id * 3 + 1], dL_dG * dG_ddely);
 				}
-				atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+				accumulateGradient(&(dL_dopacity[global_id]), G * dL_dalpha);
 				continue;
 			}
 
@@ -448,7 +459,7 @@ renderCUDA(
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				accumulateGradient(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
 
 
@@ -489,7 +500,7 @@ renderCUDA(
 				accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
 				last_normal[ch] = normal[ch]; // update last_normal
 				dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
-				atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
+				accumulateGradient((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
 			}
 
 #endif
@@ -532,26 +543,26 @@ renderCUDA(
 					pixf.x * dL_dk.z + pixf.y * dL_dl.z + dL_dz * dz_dTw.z};
 
 				// Update gradients w.r.t. 3D covariance (3x3 matrix)
-				atomicAdd(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
 			} else {
 				// // Update gradients w.r.t. center of Gaussian 2D mean position
 				const float dG_ddelx = -G * FilterInvSquare * d.x;
 				const float dG_ddely = -G * FilterInvSquare * d.y;
-				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
-				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
+				accumulateGradient(&dL_dmean2D[global_id * 3], dL_dG * dG_ddelx); // not scaled
+				accumulateGradient(&dL_dmean2D[global_id * 3 + 1], dL_dG * dG_ddely); // not scaled
+				accumulateGradient(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
 			}
 
 			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			accumulateGradient(&(dL_dopacity[global_id]), G * dL_dalpha);
 		}
 	}
 }
@@ -802,12 +813,27 @@ void BACKWARD::preprocess(
 	);
 }
 
+__global__ void castAdditiveGradients(int P, const double* values,
+    float* trans, float* mean, float* normal, float* opacity, float* colors)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= P) return;
+    for (int j = 0; j < 9; ++j) trans[9*i+j] = float(values[9*i+j]);
+    for (int j = 0; j < 3; ++j) {
+        mean[3*i+j] = float(values[9*P+3*i+j]);
+        normal[3*i+j] = float(values[12*P+3*i+j]);
+    }
+    opacity[i] = float(values[15*P+i]);
+    for (int j = 0; j < NUM_CHANNELS; ++j)
+        colors[NUM_CHANNELS*i+j] = float(values[16*P+NUM_CHANNELS*i+j]);
+}
+
 void BACKWARD::render(
 	const dim3 grid,
     const dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, int P,
 	float focal_x, float focal_y,
 	const float* bg_color,
 	const float2* means2D,
@@ -828,7 +854,9 @@ void BACKWARD::render(
 	float* dL_dcolors,
 	bool additive_mode)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+    if (!additive_mode)
+    {
+	renderCUDA<NUM_CHANNELS, float> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
@@ -846,9 +874,50 @@ void BACKWARD::render(
 		dL_depths,
 		dL_dpixconverge,
 		dL_dtransMat,
-		dL_dmean2D,
+		(float*)dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
 		dL_dcolors,
 		additive_mode);
+        return;
+    }
+    // Scratch is linear in event count, not image pixels. cudaFree synchronizes
+    // this default-stream kernel before returning to float-only preprocessing.
+    double* scratch = nullptr;
+    const size_t bytes = size_t(P) * (16 + NUM_CHANNELS) * sizeof(double);
+    if (cudaMalloc(&scratch, bytes) != cudaSuccess)
+        throw std::runtime_error("additive gradient scratch allocation failed");
+    if (cudaMemset(scratch, 0, bytes) != cudaSuccess) {
+        cudaFree(scratch);
+        throw std::runtime_error("additive gradient scratch initialization failed");
+    }
+	renderCUDA<NUM_CHANNELS, double> << <grid, block >> >(
+		ranges,
+		point_list,
+		W, H,
+		focal_x, focal_y,
+		bg_color,
+		means2D,
+		normal_opacity,
+		transMats,
+		colors,
+		depths,
+		final_Ts,
+		n_contrib,
+		n_converge,
+		dL_dpixels,
+		dL_depths,
+		dL_dpixconverge,
+		scratch,
+		scratch + 9 * P,
+		scratch + 12 * P,
+		scratch + 15 * P,
+		scratch + 16 * P,
+		additive_mode);
+    castAdditiveGradients<<<(P + 255) / 256, 256>>>(P, scratch,
+        dL_dtransMat, (float*)dL_dmean2D, dL_dnormal3D, dL_dopacity, dL_dcolors);
+    cudaError_t result = cudaGetLastError();
+    cudaError_t released = cudaFree(scratch);
+    if (result != cudaSuccess || released != cudaSuccess)
+        throw std::runtime_error("additive gradient reduction failed");
 }

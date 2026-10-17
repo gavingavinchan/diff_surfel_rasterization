@@ -25,7 +25,7 @@ namespace BACKWARD
         const dim3 block,
 		const uint2* ranges,
 		const uint32_t* point_list,
-		int W, int H,
+		int W, int H, int P,
 		float focal_x, float focal_y,
 		const float* bg_color,
 		const float2* means2D,
