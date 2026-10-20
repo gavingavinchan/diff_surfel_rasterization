@@ -230,7 +230,25 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		float2 extent;
 		bool ok = compute_aabb(T, cutoff, point_image, extent);
 		if (!ok) return;
-		radius = ceil(max(max(extent.x, extent.y), cutoff * FilterSize));
+		// Precomputed affine sonar rows map a unit latent Gaussian to pixels.
+		// Cover the actual alpha >= 1/255 support, including the screen filter.
+		// Keep compute_aabb's center (and its backward) unchanged. Row norms
+		// avoid cancellation between squared means in the affine extents.
+		const bool affine_precomp = transMat_precomp != nullptr &&
+			T[2].x == 0.0f && T[2].y == 0.0f && T[2].z == 1.0f;
+		if (affine_precomp) {
+			const float affine_support_cutoff = sqrtf(max(
+				2.0f * logf(max(255.0f * opacities[idx], 1.0f)), 0.0f));
+			extent = {
+				affine_support_cutoff * sqrtf(T[0].x*T[0].x + T[0].y*T[0].y),
+				affine_support_cutoff * sqrtf(T[1].x*T[1].x + T[1].y*T[1].y)};
+			// getRect truncates at fractional centers; one pixel of padding
+			// conservatively contains integer samples at the upper tile edge.
+			radius = 1.0f + ceil(max(max(extent.x, extent.y),
+				affine_support_cutoff * FilterSize));
+		} else {
+			radius = ceil(max(max(extent.x, extent.y), cutoff * FilterSize));
+		}
 	}
 
 	uint2 rect_min, rect_max;
